@@ -13,13 +13,17 @@
        onProgress(fraction, { frame, frames, eta, phase, message, method, captureSize, notes, paused })
        signal      an AbortSignal: cancel cleans up and rejects with an AbortError
      The Blob also carries blob.notes (plain-words remarks, e.g. "silent: this browser can't make AAC sound") and
-     blob.info ({ method, captureSize, frames, fps, width, height, seconds, secondsPerFrame, audio, audioDelay, codec,
-     bitrate }).
+     blob.info ({ version, method, captureSize, frames, fps, width, height, seconds, secondsPerFrame, audio, audioDelay,
+     audioBitrate, codec, bitrate }). secondsPerFrame is this computer's real speed: good for the next estimate.
      Errors are plain words (err.message, for the person) with err.code for the player: 'unsupported', 'busy',
      'permission' (Allow wasn't chosen), 'activation' (not straight after a click), 'wrong-surface', 'capture',
      'stage-offscreen', 'stage-hidden', 'no-frames', 'capture-ended' (Stop sharing), 'capture-error', 'codec', 'encoder',
      'sound-load', 'sound-decode'. Cancelling rejects with a DOMException named 'AbortError'.
-     recorderSupport() → { ok, reason }                  reason is plain words when ok is false
+     recorderSupport() → { ok, reason, version }         reason is plain words when ok is false
+     RECORDER_VERSION                                     this file's version (also in recorderSupport() and blob.info.version),
+                                                          so a page can show which recorder it has. BUMP IT WHEN THIS FILE CHANGES,
+                                                          and rebuild the site (node tools/site.mjs): the site's version code
+                                                          doesn't cover player/, so a stale copy there wouldn't show otherwise.
      (For testing only: debug: { capture: 'region' | 'tab', grabber: 'video' } skips the better capture methods, or reads
      the pictures through a <video> as older Chrome does. The player never passes it.)
 
@@ -34,6 +38,11 @@
         screen, bigger than most laptop windows, so fit it to the window instead). Chrome's "sharing this tab" bar makes
         the window about 40 px shorter once the capture starts: re-fit on resize. The recorder waits up to 3 s for the
         stage to be fully visible, stops with a plain message if it isn't, and checks again on every frame.
+        While Chrome captures a tab it may raise the page's devicePixelRatio (2 → 4 on a Retina Mac, measured): the
+        capture asks for up to 7680 × 4320, so Chrome draws the tab sharper, and that is what makes 4K text sharp with the
+        stage smaller than 3840 device px on screen. It doesn't change the video (always width × height). A page that
+        re-fits the stage from devicePixelRatio on resize sees it shrink (e.g. 480 × 270 CSS px at 1080p); sizing it from
+        the ratio measured before recording keeps it as it was. Both record correctly.
      2. Region Capture (track.cropTo): the tab cut to the stage's box, overlays included.
      3. The whole tab, cut to the stage's box here. Overlays on the stage are recorded too, and the stage must be fully
         in the window.
@@ -45,12 +54,25 @@
    Apple's decoder needs to honour it) into the file, as ffmpeg does: the muxer can't, so they're added to the finished
    index, in the room reserved for it. Every sound lands on its sample in ffmpeg, QuickTime/Safari and Chrome (measured),
    and the whole range is heard. If the delay can't be measured, the sound may be about 40 ms late (blob.notes says).
+   The sound is AAC at 256 kb/s like the Mac exporter's (192 where the browser's encoder can't: Windows tops out there).
+   It can only be as good as the file it's given. Measured against the WAV over the whole piece (signal-to-noise): the
+   Mac export 27.4 dB; the web page's .m4a made by ffmpeg at 160 kb/s 19.6 dB, recorded from it 19.3 (18.9 at 192 kb/s);
+   an .m4a made by Apple's encoder (afconvert) at 160 kb/s, the same size, recorded 24.1; at 256 kb/s (4.7 MB) 28.7; a
+   lossless file (WAV, FLAC) 30.4. Chrome decodes all of them to the WAV's exact length, with no offset.
+
+   Compared with the Mac exporter (tools/export.mjs, headless Chrome + x264), measured: the same frames, frame-exact, and
+   the same sound timing; the 3D is equal; the copy's edges can sit 0.5–2 px apart, because a visible Chrome draws the
+   HTML text slightly differently from a headless one (a plain screenshot shows the same); the files are ~2.5× bigger
+   (the hardware H.264 encoder needs the room to keep the gradients free of bands). The Mac export is the one for final
+   delivery.
 
    Needs Chrome or Edge 94+ on a computer (Element Capture: Chrome 132+). Vendored: ../vendor/mp4-muxer.esm.js (MIT). */
 
 import { Muxer, StreamTarget } from '../vendor/mp4-muxer.esm.js';
 
-const SAMPLE_RATE = 48000, CHANNELS = 2, AAC = 'mp4a.40.2', AAC_BITRATE = 192000;
+export const RECORDER_VERSION = '2026-09-28.2';       // (bump when this file changes; see the top)
+
+const SAMPLE_RATE = 48000, CHANNELS = 2, AAC = 'mp4a.40.2', AAC_BITRATES = [256000, 192000];   // best first (the Mac exporter: 256)
 const KEYFRAME_SECONDS = 2;
 const SIG_W = 256, SIG_H = 144;                        // the size a picture is compared at, to tell a fresh one from the last
 const QUIET_MS = 250;                                  // no changed picture this long after a seek: draw the moment again
@@ -64,7 +86,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 /* ---------------------------------------------------------------- support */
 
 export function recorderSupport() {
-  const no = reason => ({ ok: false, reason });
+  const no = reason => ({ ok: false, reason, version: RECORDER_VERSION });
   if (typeof window === 'undefined' || typeof navigator === 'undefined') return no('Recording only works in a web browser.');
   const ua = navigator.userAgent || '', uad = navigator.userAgentData;
   const mobile = uad ? !!uad.mobile : /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
@@ -76,7 +98,7 @@ export function recorderSupport() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) return no('This browser can’t capture the page. Update Chrome or Edge, and use it on a computer.');
   if (!('VideoEncoder' in window) || !('VideoFrame' in window) || !('OffscreenCanvas' in window)) return no('This browser can’t make video files. Update Chrome or Edge to the latest version.');
   if (!('MediaStreamTrackProcessor' in window) && !('requestVideoFrameCallback' in HTMLVideoElement.prototype)) return no('This browser can’t read the captured picture. Update Chrome or Edge to the latest version.');
-  return { ok: true, reason: '', elementCapture: 'RestrictionTarget' in window, regionCapture: 'CropTarget' in window, sound: 'AudioEncoder' in window };
+  return { ok: true, reason: '', version: RECORDER_VERSION, elementCapture: 'RestrictionTarget' in window, regionCapture: 'CropTarget' in window, sound: 'AudioEncoder' in window };
 }
 
 /* ---------------------------------------------------------------- encoding choices */
@@ -179,28 +201,36 @@ class Grabber {
 
 /* ---------------------------------------------------------------- sound */
 
-// the AAC encoder's delay in samples, measured: a click is encoded and decoded back, and found
-async function aacDelay() {
+// tries the AAC encoder at `bitrate` on a click, then decodes it back to find the encoder's delay in samples.
+// → { ok: the encoder made sound at this bitrate, delay: the delay, or null if it couldn't be measured }
+async function aacProbe(bitrate) {
   const N = 16384, AT = 6000, chunks = [];
   let config = null, failed = null;
   const enc = new AudioEncoder({ output: (c, m) => { const b = new Uint8Array(c.byteLength); c.copyTo(b); chunks.push({ t: c.timestamp, d: c.duration, b }); if (m && m.decoderConfig) config = m.decoderConfig; }, error: e => { failed = e; } });
-  enc.configure({ codec: AAC, sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate: AAC_BITRATE });
-  const x = new Float32Array(N * CHANNELS);
-  for (let c = 0; c < CHANNELS; c++) x[c * N + AT] = 0.9;
-  const a = new AudioData({ format: 'f32-planar', sampleRate: SAMPLE_RATE, numberOfFrames: N, numberOfChannels: CHANNELS, timestamp: 0, data: x });
-  enc.encode(a); a.close();
-  await enc.flush(); enc.close();
-  if (failed || !config || !('AudioDecoder' in window)) return null;
+  try {
+    enc.configure({ codec: AAC, sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate });
+    const x = new Float32Array(N * CHANNELS);
+    for (let c = 0; c < CHANNELS; c++) x[c * N + AT] = 0.9;
+    const a = new AudioData({ format: 'f32-planar', sampleRate: SAMPLE_RATE, numberOfFrames: N, numberOfChannels: CHANNELS, timestamp: 0, data: x });
+    enc.encode(a); a.close();
+    await enc.flush();
+  } catch (e) { failed = failed || e; }
+  try { if (enc.state !== 'closed') enc.close(); } catch {}
+  if (failed || !config || !chunks.length) return { ok: false, delay: null };
+  if (!('AudioDecoder' in window)) return { ok: true, delay: null };
   const pcm = [];
   const dec = new AudioDecoder({ output: d => { const f = new Float32Array(d.numberOfFrames); d.copyTo(f, { planeIndex: 0, format: 'f32-planar' }); pcm.push(f); d.close(); }, error: e => { failed = e; } });
-  dec.configure(config);
-  for (const c of chunks) dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: c.t, duration: c.d, data: c.b }));
-  await dec.flush(); dec.close();
-  if (failed) return null;
+  try {
+    dec.configure(config);
+    for (const c of chunks) dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: c.t, duration: c.d, data: c.b }));
+    await dec.flush();
+  } catch (e) { failed = failed || e; }
+  try { if (dec.state !== 'closed') dec.close(); } catch {}
+  if (failed) return { ok: true, delay: null };
   let best = -1, i = 0, peak = 0;
   for (const f of pcm) for (let k = 0; k < f.length; k++, i++) if (Math.abs(f[k]) > peak) { peak = Math.abs(f[k]); best = i; }
   const delay = best - AT;
-  return peak > 0.2 && delay >= 0 && delay <= 8192 ? delay : null;
+  return { ok: true, delay: peak > 0.2 && delay >= 0 && delay <= 8192 ? delay : null };
 }
 
 // fetch + decode the sound file at 48 kHz, stereo
@@ -357,11 +387,21 @@ export async function recordVideo({ stage, seek, t0, t1, fps = 30, width = 1920,
       try { if ((await VideoEncoder.isConfigSupported({ ...vbase, codec: c })).supported) { codec = c; break; } } catch {}
     }
     if (!codec) throw plainError(`This browser can’t make H.264 video at ${width}×${height}, ${fps} fps. Try 1080p, or another computer.`, 'codec');
-    let withSound = !!audioUrl;
+    // the sound: the best AAC bitrate this browser's encoder really makes (tried on a click, which also measures its delay)
+    let withSound = !!audioUrl, audioBitrate = null, delay = 0;
     if (withSound) {
-      let ok = false;
-      try { ok = 'AudioEncoder' in window && (await AudioEncoder.isConfigSupported({ codec: AAC, sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate: AAC_BITRATE })).supported; } catch {}
-      if (!ok) { withSound = false; notes.push('This browser can’t make AAC sound, so the video is silent. Chrome or Edge on a Mac or Windows computer can; or add the sound afterwards in an editor.'); }
+      let measured = null;
+      for (const br of AAC_BITRATES) {
+        let ok = false;
+        try { ok = 'AudioEncoder' in window && (await AudioEncoder.isConfigSupported({ codec: AAC, sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate: br })).supported; } catch {}
+        if (!ok) continue;
+        const p = await aacProbe(br).catch(() => ({ ok: false, delay: null }));
+        check();
+        if (p.ok) { audioBitrate = br; measured = p.delay; break; }
+      }
+      if (!audioBitrate) { withSound = false; notes.push('This browser can’t make AAC sound, so the video is silent. Chrome or Edge on a Mac or Windows computer can; or add the sound afterwards in an editor.'); }
+      else if (measured == null) notes.push('The sound encoder’s delay couldn’t be measured, so the sound may be about 40 ms late.');
+      delay = measured || 0;
     }
     check();
 
@@ -499,14 +539,9 @@ export async function recordVideo({ stage, seek, t0, t1, fps = 30, width = 1920,
     cleanups.push(() => { try { if (venc.state !== 'closed') venc.close(); } catch {} });
 
     /* 5. the sound: loaded while the pictures are recorded; fed in step with them */
-    let sound = null, soundErr = null, delay = 0, fed = 0, soundDone = !withSound;
+    let sound = null, soundErr = null, fed = 0, soundDone = !withSound;
     if (withSound) {
-      (async () => {
-        const d = await aacDelay().catch(() => null);
-        if (d == null) notes.push('The sound encoder’s delay couldn’t be measured, so the sound may be about 40 ms late.');
-        delay = d || 0;
-        sound = await loadSound(audioUrl, signal);
-      })().catch(e => { soundErr = e; });
+      loadSound(audioUrl, signal).then(s => { sound = s; }, e => { soundErr = e; });
       aenc = new AudioEncoder({
         output: (chunk, meta) => {
           try {
@@ -522,7 +557,7 @@ export async function recordVideo({ stage, seek, t0, t1, fps = 30, width = 1920,
         },
         error: e => { encError = e; },
       });
-      aenc.configure({ codec: AAC, sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate: AAC_BITRATE });
+      aenc.configure({ codec: AAC, sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate: audioBitrate });
       cleanups.push(() => { try { if (aenc.state !== 'closed') aenc.close(); } catch {} });
     }
     const S0 = Math.round(t0 * SAMPLE_RATE), BLOCK = 4800;
@@ -598,8 +633,8 @@ export async function recordVideo({ stage, seek, t0, t1, fps = 30, width = 1920,
     }
     const blob = sink.blob('video/mp4');
     blob.notes = notes.slice();
-    blob.info = { method, captureSize, frames, fps, width, height, t0, t1, seconds, secondsPerFrame: seconds / frames, redraws, slowFrames: slow,
-      audio: withSound, audioDelay: withSound ? delay : null, codec, bitrate, bytes: blob.size, grabber: grab.kind };
+    blob.info = { version: RECORDER_VERSION, method, captureSize, frames, fps, width, height, t0, t1, seconds, secondsPerFrame: seconds / frames, redraws, slowFrames: slow,
+      audio: withSound, audioDelay: withSound ? delay : null, audioBitrate: withSound ? audioBitrate : null, codec, bitrate, bytes: blob.size, grabber: grab.kind };
     report(1, { phase: 'done', frame: frames, frames, eta: 0, message: 'Done.' });
     return blob;
   } catch (e) {

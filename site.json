@@ -1,11 +1,11 @@
 {
   "app": "enhertu-sizzle-v2",
   "site": 1,
-  "version": "fdef8fa9",
-  "built": "2026-09-28T17:01:38.656Z",
+  "version": "d9fcd496",
+  "built": "2026-09-28T17:48:52.771Z",
   "newest": {
-    "file": "index.html",
-    "time": "2026-09-28T16:26:33.493Z"
+    "file": "v2.js",
+    "time": "2026-09-28T17:47:24.749Z"
   },
   "pictures": [
     {
@@ -80,5 +80,10 @@
     "made": "2026-09-28T14:47:42.602Z",
     "madeFor": {},
     "inStep": true
+  },
+  "recorder": {
+    "file": "player/recorder.js",
+    "bytes": 44577,
+    "sha256": "4070de07"
   }
 }

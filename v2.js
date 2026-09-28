@@ -56,12 +56,20 @@ await Promise.all(FR.map(async ([n]) => {
    use (a typo, a line a frame doesn't have). window.v2.content: { file, error, edits, problems, notes, fit }. The page
    reads it once, when it loads. */
 export const CONTENT = { data: null, error: null, used: new Set(), defaults: {}, edits: [], problems: [] };
-// (the browser's words and pictures: a copy, with each picture added in the browser pointing at its blob URL)
+// (the browser's words and pictures: a copy, with each picture added in the browser pointing at its blob URL. As a second
+// guard behind index.html's check, a picture must be a file name in assets/copy/ (or one added in the browser) and its
+// crop point a plain position; anything else is left out, so the picture as built shows: the copy files put these into HTML)
 const localPics = d => {
   const map = (LOCAL && LOCAL.pictures) || {}, out = JSON.parse(JSON.stringify(d));
+  const SAFE = /^assets\/copy\/[\w.-]+\.(?:jpe?g|png|webp|gif|svg)$/i, FOCUS = /^[a-z0-9 .%-]{1,40}$/i;
+  const added = s => Object.prototype.hasOwnProperty.call(map, s) && typeof map[s] === 'string' && map[s].startsWith('blob:');
   for (const f of Object.values(out.frames || {})) if (f && f.pictures && typeof f.pictures === 'object') for (const [k, v] of Object.entries(f.pictures)) {
-    const src = typeof v === 'string' ? v : v && v.src;
-    if (typeof src === 'string' && map[src.trim()]) f.pictures[k] = typeof v === 'string' ? map[src.trim()] : { ...v, src: map[src.trim()] };
+    const p = typeof v === 'string' ? { src: v } : v && typeof v === 'object' && !Array.isArray(v) ? { ...v } : null;
+    const src = p && typeof p.src === 'string' ? p.src.trim() : null;
+    if (!p || (p.src !== undefined && (src === null || (src !== '' && !SAFE.test(src) && !added(src))))) { delete f.pictures[k]; continue; }
+    if (p.focus !== undefined && !(typeof p.focus === 'string' && FOCUS.test(p.focus.trim()))) delete p.focus;
+    if (src && added(src)) p.src = map[src];
+    f.pictures[k] = typeof v === 'string' && p.src === v ? v : p;
   }
   return out;
 };

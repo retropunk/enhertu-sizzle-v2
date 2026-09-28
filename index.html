@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="data:,"><!-- (no icon file: saves a 404 on every load) -->
 <title>ENHERTU Sizzle v2 · Animatic</title>
 <link rel="stylesheet" href="https://use.typekit.net/jod3jvu.css"><!-- brand face: New Hero (Adobe Fonts web project), for the 3D letters -->
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wdth,wght@75..100,300..800&display=block" rel="stylesheet">
@@ -173,7 +174,7 @@
   body.recording .viewport { position: fixed !important; left: 0 !important; top: 0 !important; margin: 0 !important; width: var(--rec-w) !important; height: var(--rec-h) !important; max-width: none !important; aspect-ratio: auto !important; z-index: 50; isolation: isolate; box-shadow: none !important; clip-path: none !important; }
   body.recording header, body.recording .controls, body.recording #editPanel, body.recording #draftBar, body.recording #contentBar { visibility: hidden !important; }
   body.recording #hud, body.recording #onion, body.recording #cover { display: none !important; }
-  #recBar { display: none; position: fixed; z-index: 60; width: 290px; gap: 8px; padding: 12px 14px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; font-size: 13px; line-height: 1.4; }
+  #recBar { display: none; position: fixed; z-index: 60; width: 290px; gap: 8px; padding: 12px 14px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; font-size: 13px; line-height: 1.4; box-shadow: 0 8px 30px rgba(0,0,0,.45); }
   body.recording #recBar.show { display: grid; }
   #recBar .bar { height: 8px; border-radius: 4px; background: rgba(255,255,255,.08); overflow: hidden; }
   #recBar .bar i { display: block; height: 100%; width: 0; background: var(--accent); }
@@ -399,8 +400,9 @@
   const jsonOf = u => realFetch(u, { cache: 'no-store' }).then(r => (r.ok && /json/.test(r.headers.get('content-type') || '') ? r.json() : null)).catch(() => null);
   let HOSTED = false, SITE = null, HELPER = null;
   if (!EXPORT) {
-    [HELPER, SITE] = await Promise.all([jsonOf('/api/helper'), jsonOf('site.json')]);
+    HELPER = await jsonOf('/api/helper');
     if (!(HELPER && HELPER.app === 'enhertu-sizzle-v2')) HELPER = null;
+    if (!HELPER) SITE = await jsonOf('site.json');                 // (asked only where no helper answered: it exists only on the web page)
     if (!(SITE && SITE.app === 'enhertu-sizzle-v2')) SITE = null;
     // no helper: a built site (site.json), or the project served by a plain file server; an older helper still answers its other routes
     HOSTED = !HELPER && (!!SITE || !(await jsonOf('/api/export/status')));
@@ -436,9 +438,88 @@
     put(rec) { return this.tx('readwrite', s => s.put(rec)); },
     clear() { return this.tx('readwrite', s => s.clear()); },
   };
-  // what's saved in this browser (HOSTED): frames { n: adjustments }, content { base: the page's words when saved, work },
-  // pictures (records, and each one's blob: URL)
-  const WEB = { frames: {}, content: null, recs: [], urls: {}, merged: null, siteContent: undefined };
+  /* ---------- a frame's adjustments (as frames/fNN.json) in their full, tidy shape ---------- */
+  const deep = o => JSON.parse(JSON.stringify(o));
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const NEUTRAL = () => ({ timing: { holdStart: 0, holdEnd: 0 }, camera: { orbit: 0, tilt: 0, push: 0, panX: 0, panY: 0, lens: 0, roll: 0 }, sphere: { speed: 1, nudge: [0, 0, 0] } });
+  const r6 = x => Math.round(x * 1e6) / 1e6;
+  // the helper's limits for a saved frame (tools/serve.mjs normFrame), so an edit from anywhere (a loaded file of edits,
+  // this browser's storage) stays in the range the engine and the sliders expect
+  const LIM = { holdStart: [-3, 3], holdEnd: [-3, 3], orbit: [-90, 90], tilt: [-60, 60], push: [-2, 0.9], panX: [-960, 960], panY: [-540, 540], lens: [-20, 30], roll: [-45, 45], speed: [0.6, 1.5], nudge: [[-960, 960], [-540, 540], [-20, 20]] };
+  const clampTo = (v, [lo, hi], d = 0) => { const x = +v; return Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : d; };
+  const objOr = v => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+  function normEdit(e) {                                            // any file (or none) → the full, tidy, clamped shape
+    const o = NEUTRAL(); if (!e || typeof e !== 'object') return o;
+    const tm = objOr(e.timing), cm = objOr(e.camera), sp = objOr(e.sphere);
+    for (const k of ['holdStart', 'holdEnd']) o.timing[k] = r6(clampTo(tm[k], LIM[k]));
+    for (const k of Object.keys(o.camera)) o.camera[k] = r6(clampTo(cm[k], LIM[k]));
+    o.sphere.speed = r6(clampTo(sp.speed, LIM.speed, 1));
+    o.sphere.nudge = [0, 1, 2].map(i => r6(clampTo(Array.isArray(sp.nudge) ? sp.nudge[i] : 0, LIM.nudge[i])));
+    return o;
+  }
+  // what's saved in this browser (HOSTED): frames { n: adjustments } (and base { n: the web page's own adjustments they
+  // started from }), content { base: the page's words when saved, work }, pictures (records, and each one's blob: URL),
+  // notes (said once the page is up: something changed while it loaded)
+  const WEB = { frames: {}, base: {}, content: null, recs: [], urls: {}, merged: null, siteContent: undefined, notes: [] };
+  /* A words file from outside this page (a loaded file of edits, or this browser's storage) is checked before it's used.
+     Each picture must be one this web page has (site.json lists them) or one added in this browser, named
+     assets/copy/<name>.jpg|png|webp|gif|svg, and its crop point a plain position ("50% 20%"). Anything else is left out
+     (the picture as built shows there), so a crafted file can't put code into the page. (The lines of text are always
+     shown as text.) also: pictures about to be added (a file of edits brings them). → { data, dropped: [{ n, key, src }] } */
+  const SAFE_SRC = /^assets\/copy\/[\w.-]+\.(?:jpe?g|png|webp|gif|svg)$/i, SAFE_FOCUS = /^[a-z0-9 .%-]{1,40}$/i;
+  function cleanWords(d, also = null) {
+    if (!d || typeof d !== 'object' || !d.frames || typeof d.frames !== 'object') return { data: d, dropped: [] };
+    const out = deep(d), dropped = [];
+    const known = SITE && Array.isArray(SITE.pictures) ? new Set([...SITE.pictures.map(p => p && p.src), ...WEB.recs.map(r => r.src), ...(also || [])]) : null;
+    for (const [k, f] of Object.entries(out.frames)) {
+      if (!f || typeof f !== 'object' || !f.pictures || typeof f.pictures !== 'object') continue;
+      for (const [key, v] of Object.entries(f.pictures)) {
+        const p = typeof v === 'string' ? { src: v } : v && typeof v === 'object' && !Array.isArray(v) ? { ...v } : null;
+        const src = p && typeof p.src === 'string' ? p.src.trim() : null;
+        if (!p || (p.src !== undefined && (src === null || (src !== '' && (!SAFE_SRC.test(src) || (known && !known.has(src))))))) {
+          dropped.push({ n: +k, key, src: String(src ?? (p ? p.src : v)).slice(0, 60) }); delete f.pictures[key]; continue;
+        }
+        let fixed = false;
+        if (p.focus !== undefined && !(typeof p.focus === 'string' && SAFE_FOCUS.test(p.focus.trim()))) { delete p.focus; fixed = true; }
+        if (p.fit !== undefined && p.fit !== 'cover' && p.fit !== 'contain') { delete p.fit; fixed = true; }
+        if (fixed) f.pictures[key] = p;
+      }
+    }
+    return { data: out, dropped };
+  }
+  const droppedNote = list => `Left out ${list.length > 1 ? `${list.length} pictures that aren’t` : 'a picture that isn’t'} on this web page (${list.slice(0, 3).map(d => `frame ${d.n} “${d.key}”`).join(', ')}${list.length > 3 ? ' …' : ''}): the picture as built shows there.`;
+  // frames saved in this browser → what's stored: { n: { edit, base } } (base: the web page's own adjustments for that
+  // frame when it was saved: `site`, or as kept; an older page stored just the edit, with no base)
+  const storeOf = (frames, site = null) => {
+    const o = {};
+    for (const [n, e] of Object.entries(frames)) { const b = site ? site[n] || NEUTRAL() : WEB.base[n]; o[n] = b ? { edit: e, base: b } : { edit: e }; }
+    return Object.keys(o).length ? o : null;
+  };
+  const publishedFrame = n => realFetch(`frames/f${String(n).padStart(2, '0')}.json`, { cache: 'no-store' })
+    .then(r => (r.status === 404 ? NEUTRAL() : r.ok ? r.json().then(normEdit) : null)).catch(() => null);
+  // the frame adjustments saved in this browser. If the web page was published again since, with other adjustments for a
+  // frame saved here, its new ones come in part by part (timing, camera, sphere) wherever this browser didn't change that part.
+  async function loadWebFrames() {
+    const all = LS.get('v2web.frames'); if (!all || typeof all !== 'object') return;
+    const moved = []; let rewrite = false;
+    await Promise.all(Object.entries(all).filter(([k, e]) => /^\d{1,2}$/.test(k) && e && typeof e === 'object').map(async ([k, e]) => {
+      const n = +k, wrapped = e.edit && typeof e.edit === 'object';
+      const edit = normEdit(wrapped ? e.edit : e); let base = wrapped && e.base && typeof e.base === 'object' ? normEdit(e.base) : null;
+      if (base) {
+        const pub = await publishedFrame(n);
+        if (pub && !same(pub, base)) {
+          let took = false;
+          for (const part of ['timing', 'camera', 'sphere']) if (same(edit[part], base[part]) && !same(pub[part], base[part])) { edit[part] = deep(pub[part]); took = true; }
+          if (took) moved.push(n);
+          base = pub; rewrite = true;
+        }
+        if (pub && same(edit, pub)) { rewrite = true; return; }       // (nothing of this browser's own is left on that frame)
+      }
+      WEB.frames[n] = edit; WEB.base[n] = base;
+    }));
+    if (rewrite) try { LS.put('v2web.frames', storeOf(WEB.frames)); } catch {}
+    if (moved.length) WEB.notes.push(`The web page was updated since you saved frame${moved.length > 1 ? 's' : ''} ${moved.sort((a, b) => a - b).join(', ')}: its new adjustments are in, with your own changes kept on top.`);
+  }
   const fetchSiteContent = () => realFetch('content/copy.json?site=' + Date.now(), { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).catch(() => null);
   /* three versions of the words → one, on the file's own shape (no knowledge of the copy needed): each line and picture
      "mine" changed from "base" wins; everything else comes from "theirs". (Used when the page was published again since
@@ -460,17 +541,23 @@
     return out;
   }
   if (HOSTED) {
-    const fr0 = LS.get('v2web.frames'); if (fr0 && typeof fr0 === 'object') for (const [k, e] of Object.entries(fr0)) if (/^\d{1,2}$/.test(k) && e && typeof e === 'object') WEB.frames[+k] = e;
+    WEB.recs = (await PICS.all()).filter(r => r && typeof r.src === 'string' && SAFE_SRC.test(r.src) && r.blob);
+    for (const r of WEB.recs) WEB.urls[r.src] = URL.createObjectURL(r.blob);
+    await loadWebFrames();
     const c0 = LS.get('v2web.content'); if (c0 && c0.work && c0.work.frames && typeof c0.work.frames === 'object') WEB.content = c0;
-    WEB.recs = await PICS.all();
-    for (const r of WEB.recs) if (r && r.src && r.blob) WEB.urls[r.src] = URL.createObjectURL(r.blob);
-    // the words saved here, taking in anything the page's own words file changed since they were saved
+    // the words saved here, taking in anything the page's own words file changed since they were saved (and checked)
     if (WEB.content) {
       WEB.siteContent = await fetchSiteContent();
       const sc = WEB.siteContent, b = WEB.content.base;
-      WEB.merged = sc && b && JSON.stringify(sc) !== JSON.stringify(b) ? mergeWords(b, WEB.content.work, sc) : WEB.content.work;
+      const cw = cleanWords(sc && b && JSON.stringify(sc) !== JSON.stringify(b) ? mergeWords(b, WEB.content.work, sc) : WEB.content.work);
+      WEB.merged = cw.data;
+      if (cw.dropped.length) {                                      // (kept checked from now on)
+        WEB.notes.push(droppedNote(cw.dropped));
+        WEB.content = { base: b, work: cleanWords(WEB.content.work).data };
+        try { LS.put('v2web.content', WEB.content); } catch {}
+      }
     }
-    const words = contentDraft || WEB.merged;
+    const words = contentDraft ? cleanWords(contentDraft).data : WEB.merged;
     if (Object.keys(WEB.frames).length || words || WEB.recs.length)
       window.__v2Local = { frames: Object.fromEntries(Object.entries(WEB.frames).map(([n, e]) => [n, { frame: +n, ...e }])), content: words || null, pictures: WEB.urls };
   } else if (contentDraft) window.fetch = (u, o) => u === 'content/copy.json'
@@ -523,15 +610,16 @@
     if (!REC.on) for (const f of hooks) f(n);                        // (nothing else runs while recording)
   };
   P.seek = t => { P.t = Math.min(END, Math.max(0, t)); P.draw(); };
+  // (while recording in the browser the clock never runs: the recorder alone moves the playhead, one video frame at a time)
   P.tick = now => {
-    if (!P.playing) return;
+    if (!P.playing || REC.on) return;
     P.t += (now - P.last) / 1000 * P.speed; P.last = now;
     if (P.stopAt !== null && P.t >= P.stopAt) { P.t = P.stopAt; P.draw(); P.pause(); return; }
     if (P.t >= END) { if ($('#loop').checked) P.t = 0; else { P.t = END; P.pause(); } }
     if (P.playing) SND.sync();
     P.draw(); requestAnimationFrame(P.tick);
   };
-  P.play = () => { if (P.t >= END - 1e-3) P.t = 0; P.playing = true; P.last = performance.now(); $('#play').textContent = 'Pause'; SND.ensure(); SND.start(); requestAnimationFrame(P.tick); };
+  P.play = () => { if (REC.on) return; if (P.t >= END - 1e-3) P.t = 0; P.playing = true; P.last = performance.now(); $('#play').textContent = 'Pause'; SND.ensure(); SND.start(); requestAnimationFrame(P.tick); };
   P.pause = () => { P.playing = false; P.stopAt = null; $('#play').textContent = 'Play'; SND.stop(); };
   P.playRange = (a, b) => { P.pause(); P.seek(a); P.stopAt = b; P.play(); };
   let drawQueued = false;
@@ -594,7 +682,7 @@
     if (q.get(cb.dataset.layer) === '0') { cb.checked = false; stage.classList.add('hide-' + cb.dataset.layer); }
     cb.onchange = () => { stage.classList.toggle('hide-' + cb.dataset.layer, !cb.checked); P.draw(); };
   });
-  addEventListener('keydown', e => { if (e.code === 'Space' && e.target === document.body) { e.preventDefault(); $('#play').click(); } });
+  addEventListener('keydown', e => { if (e.code === 'Space' && e.target === document.body && !REC.on) { e.preventDefault(); $('#play').click(); } });
   // hooks for the dev scripts (same names as v1's exporter uses)
   window.seekTo = t => { P.pause(); P.seek(t); };
   window.render3D = t => render(t);
@@ -606,8 +694,6 @@
      words and pictures (content/copy.json, POST /api/content). Changes preview live and stay unsaved until Save.
      ===================================================================== */
   const E = { open: false, n: 1, tab: 'move', follow: true };
-  const deep = o => JSON.parse(JSON.stringify(o));
-  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   let selfReload = false;
   const OLD_HELPER = 'the player\u2019s helper is an older version that can\u2019t do this yet. Restart it: stop it (Ctrl+C in its Terminal window, or close the window) and start it again with node tools/serve.mjs in the test-animation-v2 folder, then reload this page';
@@ -628,17 +714,7 @@
     } catch (err) { return fetchErr(err); }
   }
 
-  /* ---------- a frame's adjustments ---------- */
-  const NEUTRAL = () => ({ timing: { holdStart: 0, holdEnd: 0 }, camera: { orbit: 0, tilt: 0, push: 0, panX: 0, panY: 0, lens: 0, roll: 0 }, sphere: { speed: 1, nudge: [0, 0, 0] } });
-  const r6 = x => Math.round(x * 1e6) / 1e6;
-  function normEdit(e) {                                            // any file (or none) → the full, tidy shape
-    const o = NEUTRAL(); if (!e) return o;
-    for (const k of ['holdStart', 'holdEnd']) o.timing[k] = r6(+(e.timing || {})[k] || 0);
-    for (const k of Object.keys(o.camera)) o.camera[k] = r6(+(e.camera || {})[k] || 0);
-    const sp = e.sphere || {}; o.sphere.speed = r6(+sp.speed || 1);
-    o.sphere.nudge = [0, 1, 2].map(i => r6(+(Array.isArray(sp.nudge) ? sp.nudge[i] : 0) || 0));
-    return o;
-  }
+  /* ---------- a frame's adjustments (NEUTRAL, normEdit: at the top) ---------- */
   const isNeutral = e => same(normEdit(e), NEUTRAL());
   const fileOf = (n, e) => ({ frame: n, ...deep(e) });
   const pad2 = n => String(n).padStart(2, '0');
@@ -878,7 +954,10 @@
     let name = `${stem}.${kind}`;
     for (let i = 2; taken.has(name.toLowerCase()); i++) name = `${stem}-${i}.${kind}`;
     const rec = { src: `assets/copy/${name}`, name, type: MIME[kind], bytes: buf.byteLength, time: new Date().toISOString(), hash, blob: new Blob([buf], { type: MIME[kind] }) };
-    try { await PICS.put(rec); } catch (e) { throw new Error(`this browser won’t keep pictures (${(e && e.message) || 'no storage'}; a private window, or site data turned off)`); }
+    try { await PICS.put(rec); } catch (e) {
+      throw new Error(/quota/i.test(`${e && e.name} ${e && e.message}`) ? 'this browser’s storage for the page is full (Download my edits keeps your edits in a file; Reset all my edits makes room)'
+        : 'this browser won’t keep pictures for this page (a private window, or site data turned off)');
+    }
     WEB.recs.push(rec); WEB.urls[rec.src] = URL.createObjectURL(rec.blob);
     return { src: rec.src, name };
   }
@@ -1100,14 +1179,15 @@
       ? (dirty ? 'Unsaved: you’re seeing the change. Save keeps it in this browser.' : isNeutral(savedEd[n]) ? 'As built (no adjustments).' : WEB.frames[n] ? 'Saved in this browser.' : 'As published (the web page’s own adjustments).')
       : (dirty ? 'Unsaved: you’re seeing the change, but exports won’t include it until you save.' : isNeutral(savedEd[n]) ? 'As built (no adjustments).' : `Saved in frames/f${String(n).padStart(2, '0')}.json.`));
   }
-  // HOSTED: Save keeps the frame's adjustments in this browser (only where they differ from the web page's own)
+  // HOSTED: Save keeps the frame's adjustments in this browser (only where they differ from the web page's own), each with
+  // the web page's own adjustments it started from (so a later update of the web page can come in: loadWebFrames)
   async function saveFrameHere(n, { noReload } = {}) {
     const e = normEdit(curEd(n)), timingWas = savedEd[n].timing;
     try {
-      const site = (await siteFrames())[n] || NEUTRAL(), next = { ...WEB.frames };
-      if (same(e, site)) delete next[n]; else next[n] = e;
-      LS.put('v2web.frames', Object.keys(next).length ? next : null);
-      WEB.frames = next;
+      const all = await siteFrames(), next = { ...WEB.frames };
+      if (same(e, all[n] || NEUTRAL())) delete next[n]; else next[n] = e;
+      LS.put('v2web.frames', storeOf(next, all));
+      WEB.frames = next; for (const m of Object.keys(next)) WEB.base[m] = all[m] || NEUTRAL();
     } catch (err) {
       const m = `Couldn’t save frame ${n} in this browser: ${err.message}.`;
       if (E.open && E.n === n && E.tab === 'move') moveStatus(m, 'err'); else alert(m);
@@ -1443,7 +1523,7 @@
     const [t0, t1] = rangeOf(s.fromFrame, s.toFrame), secs = (t1 - t0) / s.speed, frames = Math.max(1, Math.round(secs * s.fps));
     const est = 6 + frames / (s.res === '4k' ? 7.5 : 17);
     const on = Object.entries(s.layers).filter(([k, v]) => v && (full || k !== 'sphere')).map(([k]) => ({ text: 'text', shapes: 'copy shapes', images: 'images', sphere: 'sphere' })[k]);
-    $('#exUses').innerHTML = `${s.fromFrame === s.toFrame ? `Frame <b>${s.fromFrame}</b>` : `Frames <b>${s.fromFrame}–${s.toFrame}</b>`} (${fmt(t0)}–${fmt(t1)}) · <b>${secs.toFixed(1)} s</b> · ${frames} video frames · layers <b>${on.join(', ') || 'none'}</b>${s.speed !== 1 ? ` · <b>${s.speed}×</b>` : ''}${full && s.audio.length ? ' · <b>sound</b>' : ''}<br>About ${fmtDur(est)} to make${X.info ? ` · version <b>${X.info.version.stamp}</b>` : ''}.`;
+    $('#exUses').innerHTML = `${s.fromFrame === s.toFrame ? `Frame <b>${s.fromFrame}</b>` : `Frames <b>${s.fromFrame}–${s.toFrame}</b>`} (${fmt(t0)}–${fmt(t1)}) · <b>${secs.toFixed(1)} s</b> · ${frames} video frames · layers <b>${on.join(', ') || 'none'}</b>${s.speed !== 1 ? ` · <b>${s.speed}×</b>` : ''}${full && s.audio.length ? ' · <b>sound</b>' : ''}<br>About ${fmtEst(est)} to make${X.info ? ` · version <b>${X.info.version.stamp}</b>` : ''}.`;
     $('#exFromImg').src = boardSrc(s.fromFrame); $('#exToImg').src = boardSrc(s.toFrame);
     // the words file: a mistake means the video would have the original words
     const ce = X.content && X.content.error, probs = (!C.shown && window.v2.content && window.v2.content.problems) || [];
@@ -1455,7 +1535,9 @@
     else if (!ce && probs.length) notes.push(`Parts of the words file are skipped (${probs.length}): ${esc(probs.slice(0, 2).map(p => p.replace(/^content\/copy\.json: /, '')).join(' · '))}${probs.length > 2 ? ' …' : ''}.`);
     w.hidden = !notes.length; w.innerHTML = notes.join('<br>');
   }
-  const fmtDur = s => s >= 90 ? `${Math.round(s / 60)} min` : `${Math.max(1, Math.round(s))} s`;
+  // a duration in plain words ("45 s", "1 min 38 s", "12 min"), and an estimate, rounded as estimates are ("25 s", "1.5 min")
+  const fmtDur = s => { const r = Math.max(1, Math.round(s)); return r < 60 ? `${r} s` : r < 600 ? `${Math.floor(r / 60)} min${r % 60 ? ` ${r % 60} s` : ''}` : `${Math.round(r / 60)} min`; };
+  const fmtEst = s => s < 55 ? `${Math.max(5, Math.round(s / 5) * 5)} s` : s < 600 ? `${Math.round(s / 30) / 2} min` : `${Math.round(s / 60)} min`;
   dlg.addEventListener('change', e => {
     if (e.target.name === 'exPass') $('#exTrans').checked = e.target.value === 'full';   // each version's usual choice
     if (e.target === xFrom && +xTo.value < +xFrom.value) xTo.value = xFrom.value;
@@ -1541,6 +1623,7 @@
     } catch (e) { xShow({ state: 'error', error: fetchErr(e) }); $('#exStart').disabled = false; }
   };
   $('#exCancel').onclick = () => { if (HOSTED) { if (RV.ac) RV.ac.abort(); return; } realFetch('/api/export/cancel', { method: 'POST' }).then(xPoll); };
+  $('#recCancel').onclick = () => { if (RV.ac) RV.ac.abort(); };     // (the progress panel's own Cancel, while recording)
   $('#exOpen').onclick = () => realFetch('/api/export/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ open: true }) });
   $('#exReveal').onclick = () => realFetch('/api/export/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
 
@@ -1548,11 +1631,17 @@
      HOSTED: RECORD THE VIDEO IN THIS BROWSER (player/recorder.js)
      The recorder captures this tab (the browser asks first: share this tab), keeps just the picture, and steps the piece
      one video frame at a time: frame i is exactly the moment t0 + i / fps, never real time, so a slow computer only takes
-     longer. While it records, the picture is pinned to the top left of the window at the video's size in screen pixels
-     (1920×1080 for 1080p: 960×540 on a Retina screen), with everything else hidden (panels, notes, the board overlay);
-     the progress sits beside or below it, and Esc cancels. Afterwards the page is put back as it was.
+     longer. While it records, the picture is pinned to the top left of the window, wholly in view (Chrome captures only
+     what's on screen, but at the video's full size whatever the picture's size there): the video's size in screen pixels
+     as measured before the capture (1080p: 960×540 on a Retina screen), or the largest 16:9 box the window has room for,
+     re-fitted when the window changes (Chrome's "sharing this tab" bar makes it shorter). Everything else is hidden
+     (panels, notes, the board overlay); the progress sits beside or below it; Esc or its Cancel button stops it; the
+     player's clock and keys are off meanwhile. Afterwards the page is put back as it was.
      ===================================================================== */
-  const RV = { mod: null, loadErr: null, support: null, aac: null, busy: false, ac: null, touched: false, smallest: null, settled: null, settledOk: false, version: null };
+  const RV = { mod: null, loadErr: null, support: null, aac: null, busy: false, ac: null, touched: false, settled: null, settledOk: false };
+  // how fast this computer recorded last time (seconds a video frame, by size), for the panel's estimate (this browser only)
+  const recSpeed = key => { try { const v = +(JSON.parse(localStorage.getItem('v2.recSpeed')) || {})[key]; return v > 0 && v < 5 ? v : null; } catch { return null; } };
+  const keepSpeed = (key, v) => { try { const o = JSON.parse(localStorage.getItem('v2.recSpeed')) || {}; o[key] = +(+v).toFixed(4); localStorage.setItem('v2.recSpeed', JSON.stringify(o)); } catch {} };
   const LAYER_NAMES = { text: 'text', shapes: 'copy shapes', images: 'images', sphere: 'sphere' };
   async function recorderReady() {
     if (!RV.mod && !RV.loadErr) { try { RV.mod = await import('./player/recorder.js'); } catch (e) { RV.loadErr = (e && e.message) || String(e); } }
@@ -1617,10 +1706,10 @@
     return h ? h.slice(0, 8) : base;
   }
   // named as the Mac exporter names a full video (tools/export.mjs fileName)
-  function recName(s, withSound, stamp) {
+  function recName(s, withSound, ver, when = stampNow()) {
     const off = ['text', 'shapes', 'images', 'sphere'].filter(l => !s.layers[l]);
     return ['ENHERTU-sizzle-v2', 'full', `${s.res === '4k' ? '4K' : '1080p'}${s.fps}`, s.fromFrame === s.toFrame ? `f${s.fromFrame}` : `f${s.fromFrame}-${s.toFrame}`,
-      off.length ? 'no-' + off.join('-') : '', withSound ? 'sound' : '', `ver-${stamp}`, stampNow()].filter(Boolean).join('_') + '.mp4';
+      off.length ? 'no-' + off.join('-') : '', withSound ? 'sound' : '', `ver-${ver}`, when].filter(Boolean).join('_') + '.mp4';
   }
   function saveBlob(blob, name) {                                    // → the browser's Downloads folder
     const a = document.createElement('a'), u = URL.createObjectURL(blob);
@@ -1633,29 +1722,38 @@
     $('#exWebNo').innerHTML = sup && !ok ? `<b>This browser can’t record the video.</b> ${esc(sup.reason || '')} You can still <b>Download edits for the Mac exporter</b> and make the video on the Mac (the v2 player’s Load edits…, then Export video…).` : '';
     // how big the picture can be in this window (a little room is kept for the browser's "sharing this tab" bar)
     const f = recFits(W, H, 40), big = s.res === '4k' ? '4K' : '1080p';
-    $('#exSize').innerHTML = f.exact ? `This window can show the picture at the full ${W}×${H} pixels.`
+    $('#exSize').innerHTML = !ok ? '' : f.exact ? `This window can show the picture at the full ${W}×${H} pixels.`
       : `This window shows the picture at up to ${f.w}×${f.h} screen pixels. Chrome can often still record it at the full ${big} size; if it can’t, the video is enlarged from that (a little softer) and a note says so afterwards. A bigger window${s.res === '4k' ? ' or screen' : ' (or View → Enter Full Screen)'} avoids it.`;
     // the sound
     const snd = $('#exSound'), there = !SITE || !!SITE.sound, late = soundLateHere();
     snd.disabled = !there;
     if (!RV.touched) snd.checked = there && !late.length;
     $('#exSoundName').textContent = there ? 'Sound effects' : 'Sound effects (not on this web page)';
-    $('#exSoundHint').innerHTML = !there ? 'This web page has no sound effects track.'
+    $('#exSoundHint').innerHTML = !ok ? '' : !there ? 'This web page has no sound effects track.'
       : RV.aac === false && snd.checked ? '<span style="color:var(--unsaved)">This browser can’t make AAC sound, so the video will be silent.</span>'
       : late.length ? `<span style="color:var(--unsaved)">The sound effects were made for the published timing; with your changes to ${lateText(late)} some sounds would land early or late.</span>${snd.checked ? '' : ' So the sound is <b>off</b> for this recording (tick it to include it as it is).'}`
       : snd.checked ? 'Laid under the video, cut to the frames you choose. There’s no music bed yet.' : '';
-    // what it will make
-    const [t0, t1] = rangeOf(s.fromFrame, s.toFrame), secs = t1 - t0, frames = Math.max(1, Math.round(secs * s.fps)), est = 4 + frames * (W > 1920 ? 0.16 : 0.07);
+    // what it will make, and about how long it takes (frame by frame, never in real time: from this computer's last
+    // recording, or else a little over what a recent Mac with a 120 Hz screen took, 0.022 s a frame at 1080p and 0.028 at
+    // 4K, and up to twice that elsewhere)
+    const [t0, t1] = rangeOf(s.fromFrame, s.toFrame), secs = t1 - t0, frames = Math.max(1, Math.round(secs * s.fps));
+    const known = recSpeed(s.res), est = 3 + frames * (known || (W > 1920 ? 0.035 : 0.025));
     const on = Object.entries(s.layers).filter(([, v]) => v).map(([k]) => LAYER_NAMES[k]);
-    $('#exUses').innerHTML = `${s.fromFrame === s.toFrame ? `Frame <b>${s.fromFrame}</b>` : `Frames <b>${s.fromFrame}–${s.toFrame}</b>`} (${fmt(t0)}–${fmt(t1)}) · <b>${secs.toFixed(1)} s</b> · ${frames} video frames · layers <b>${on.join(', ') || 'none'}</b>${s.sound && RV.aac !== false ? ' · <b>sound</b>' : ''}`
-      + `<br>About ${fmtDur(est)} to record (frame by frame: a slower computer just takes longer)${SITE ? ` · version <b>${esc(SITE.version)}</b>${editedHere() ? ' with your edits' : ''}` : ''}.`;
+    $('#exUses').innerHTML = `${s.fromFrame === s.toFrame ? `Frame <b>${s.fromFrame}</b>` : `Frames <b>${s.fromFrame}–${s.toFrame}</b>`} (${fmt(t0)}–${fmt(t1)}) · <b>${secs.toFixed(1)} s</b> · ${frames} video frames · layers <b>${on.join(', ') || 'none'}</b>${ok && s.sound && RV.aac !== false ? ' · <b>sound</b>' : ''}`
+      + (!ok ? '' : `<br>About ${fmtEst(est)} to record${known ? ' (as this computer went last time)' : `, or up to ${fmtEst(2 * est)} on an older computer or a 60 Hz screen`}`
+        + `${SITE ? ` · version <b title="${esc(SITE.recorder && SITE.recorder.sha256 ? `recorder ${SITE.recorder.sha256}` : '')}">${esc(SITE.version)}</b>${editedHere() ? ' with your edits' : ''}` : ''}.`);
     $('#exFromImg').src = boardSrc(s.fromFrame); $('#exToImg').src = boardSrc(s.toFrame);
     $('#exContent').hidden = true;
-    const un = FR.map(x => x[0]).filter(frameUnsaved), notes = [];
-    if (un.length) notes.push(`It records what the picture shows now, including your <b>unsaved changes</b> on frame${un.length > 1 ? 's' : ''} ${un.join(', ')}${C.shown ? ' and the words you’re previewing' : ''}. Save keeps them in this browser.`);
+    // what the picture shows is what's recorded: say which unsaved changes that includes, and which it can't yet
+    const moves = Object.keys(frameDrafts).map(Number).sort((a, b) => a - b), typed = needsPreview(), un = FR.map(x => x[0]).filter(frameUnsaved), notes = [];
+    if (moves.length) notes.push(`It records what the picture shows now, including your <b>unsaved</b> timing, camera and sphere changes on ${listFrames(moves)}.`);
+    if (typed) notes.push(C.shown ? 'It records the words of your last <b>preview</b>. Changes since then aren’t in the picture yet, so they won’t be in the video: press <b>Preview</b> first (Edit mode → Words &amp; pictures).'
+      : 'Word and picture changes you’ve typed <b>aren’t in the picture</b> until you press <b>Preview</b> (Edit mode → Words &amp; pictures), so they won’t be in the video yet.');
     else if (C.shown) notes.push('It records the words you’re previewing (not saved yet).');
+    if (un.length) notes.push('Save keeps your changes in this browser.');
     const w = $('#exWarn'); w.hidden = !notes.length; w.innerHTML = notes.join('<br>');
-    $('#exHow').innerHTML = '<b>How it works:</b> press <b>Record video</b> and the browser asks what to share: choose <b>this tab</b> and press <b>Share</b>. The picture then sits at the top left of the window and steps through the piece. Leave this tab in front and don’t resize it until it’s done (other apps are fine). <b>Esc</b> cancels. The video goes to your Downloads folder.';
+    $('#exHow').innerHTML = '<b>How it works:</b> press <b>Record video</b> and the browser asks what to share: choose <b>this tab</b> and press <b>Share</b>. The picture then sits at the top left of the window and steps through the piece (the video still comes out at its full size). Leave this tab in front and don’t resize it until it’s done (other apps are fine). <b>Esc</b> or <b>Cancel</b> stops it. The video goes to your Downloads folder.'
+      + '<br>For the final delivery, use the Mac export: a video made here can differ from it by a pixel or two at the edges of the words.';
     if (!RV.busy) { $('#exStart').disabled = !ok || !RV.settledOk; $('#exStart').title = !RV.settledOk ? 'Getting the fonts and pictures ready…' : ''; }
   }
   function recShow(state, html) {
@@ -1680,17 +1778,23 @@
     describeRecord();
   }
   // shows moment t and resolves once that frame is drawn and on screen (the recorder then takes the next captured frame)
-  const seekFrame = t => new Promise(res => { P.seek(t); requestAnimationFrame(() => requestAnimationFrame(() => res())); });
-  function recLayout() {                                            // the picture at the video's size in screen pixels (or as big as fits)
-    const f = recFits(REC.W, REC.H);
-    REC.cssW = f.w / f.dpr; REC.cssH = f.h / f.dpr;
-    if (!RV.smallest || f.w < RV.smallest.w) RV.smallest = f;
+  const seekFrame = t => new Promise(res => { if (P.playing) P.pause(); P.seek(t); requestAnimationFrame(() => requestAnimationFrame(() => res())); });
+  /* the picture's size on screen while recording (CSS px): the video's size in screen pixels at the pixel ratio measured
+     before the capture started (Chrome raises the page's pixel ratio while it captures a tab; that changes nothing here),
+     or, when the window is smaller, the largest 16:9 box it has room for. Re-fitted on every resize, both ways. */
+  function recLayout() {
+    const w0 = REC.W / REC.dpr0, h0 = REC.H / REC.dpr0, k = Math.min(1, innerWidth / w0, innerHeight / h0);
+    REC.cssW = k >= 1 ? w0 : Math.floor(w0 * k); REC.cssH = REC.cssW * 9 / 16;
     document.body.style.setProperty('--rec-w', `${REC.cssW}px`); document.body.style.setProperty('--rec-h', `${REC.cssH}px`);
     fit();
+    // the progress: beside or below the picture; with no room there, over its lower right corner, but only once the
+    // recorder says it captures the picture alone (Element Capture leaves out whatever is drawn over it). Otherwise the
+    // progress is in the tab's title, and Esc cancels.
     const bar = $('#recBar'), right = innerWidth - REC.cssW, below = innerHeight - REC.cssH;
-    bar.classList.toggle('show', right >= 310 || below >= 130);   // (no room: the progress is in the tab's title; Esc cancels)
-    if (right >= 310) { bar.style.left = `${REC.cssW + 12}px`; bar.style.top = '12px'; }
-    else if (below >= 130) { bar.style.left = '12px'; bar.style.top = `${REC.cssH + 12}px`; }
+    const place = right >= 310 ? 'right' : below >= 130 ? 'below' : REC.method === 'element' ? 'over' : null;
+    bar.classList.toggle('show', !!place);
+    Object.assign(bar.style, place === 'right' ? { left: `${REC.cssW + 12}px`, top: '12px', right: 'auto', bottom: 'auto' }
+      : place === 'below' ? { left: '12px', top: `${REC.cssH + 12}px`, right: 'auto', bottom: 'auto' } : { left: 'auto', top: 'auto', right: '12px', bottom: '12px' });
   }
   function enterRecording(s, W, H) {
     const was = { t: P.t, notes: view.notes, hide: [...stage.classList].filter(c => c.startsWith('hide-')), title: document.title };
@@ -1698,19 +1802,24 @@
     view.notes = false;
     for (const l of ['text', 'shapes', 'images', 'sphere']) stage.classList.toggle('hide-' + l, !s.layers[l]);
     if (W > 1920 && V.setRenderScale) V.setRenderScale(2);          // (4K: the 3D picture drawn at 3840×2160)
-    Object.assign(REC, { on: true, W, H });
-    RV.smallest = null;
+    Object.assign(REC, { on: true, W, H, dpr0: Math.max(1, window.devicePixelRatio || 1), method: null });
+    if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();   // (no button keeps the keyboard)
     document.body.classList.add('recording');
     recLayout(); addEventListener('resize', recLayout);
-    const onKey = e => { if (e.key === 'Escape' && RV.ac) { e.preventDefault(); RV.ac.abort(); } };
-    addEventListener('keydown', onKey, true);
+    // the keyboard while recording: Esc cancels; nothing else reaches the page (Space would start the player's clock and
+    // move the picture between the recorder's frames). The browser's own shortcuts (⌘ / Ctrl) still work.
+    const onKey = e => {
+      if (e.key === 'Escape') { e.preventDefault(); if (RV.ac) RV.ac.abort(); return; }
+      e.stopImmediatePropagation(); if (!e.metaKey && !e.ctrlKey) e.preventDefault();
+    };
+    addEventListener('keydown', onKey, true); addEventListener('keyup', onKey, true); addEventListener('keypress', onKey, true);
     $('#recFill').style.width = '0'; $('#recTitle').textContent = `Recording ${s.res === '4k' ? '4K' : '1080p'} · ${s.fps} fps`;
     $('#recText').textContent = 'The browser asks what to share: choose this tab, then Share.';
     document.title = 'Recording… · ENHERTU Sizzle v2';
     P.seek(rangeOf(s.fromFrame, s.toFrame)[0]);
     return () => {
-      removeEventListener('resize', recLayout); removeEventListener('keydown', onKey, true);
-      REC.on = false; document.body.classList.remove('recording');
+      removeEventListener('resize', recLayout); for (const k of ['keydown', 'keyup', 'keypress']) removeEventListener(k, onKey, true);
+      REC.on = false; P.pause(); document.body.classList.remove('recording');
       document.body.style.removeProperty('--rec-w'); document.body.style.removeProperty('--rec-h');
       for (const c of [...stage.classList]) if (c.startsWith('hide-')) stage.classList.remove(c);
       for (const c of was.hide) stage.classList.add(c);
@@ -1720,6 +1829,7 @@
     };
   }
   function recProgress(fraction, info = {}) {
+    if (info.method && info.method !== REC.method && REC.on) { REC.method = info.method; recLayout(); }   // (how it captures: where the progress can go)
     const x = Math.max(0, Math.min(1, +fraction || 0)), pct = Math.round(100 * x);
     $('#recFill').style.width = `${(100 * x).toFixed(1)}%`; xBar.style.width = `${(100 * x).toFixed(1)}%`;
     $('#recText').textContent = info.frames && info.frame ? `Frame ${info.frame} of ${info.frames}${info.eta != null && Number.isFinite(+info.eta) ? ` · about ${fmtDur(+info.eta)} left` : ''}` : info.message || `${pct}%`;
@@ -1731,7 +1841,9 @@
     const s = recSettings(), W = s.res === '4k' ? 3840 : 1920, H = s.res === '4k' ? 2160 : 1080;
     const [t0, t1] = rangeOf(s.fromFrame, s.toFrame), withSound = s.sound && RV.aac !== false;
     const audioUrl = withSound ? new URL((SITE && SITE.sound && SITE.sound.src) || 'assets/sound/sfx-stem-v2.m4a', location.href).href : null;
-    const name = recName(s, withSound, await versionHere()), started = performance.now();
+    // (nothing is awaited before recordVideo: its first step asks to share the tab, which the browser allows only
+    // straight after a click; the version code for the name is worked out meanwhile)
+    const verP = versionHere().catch(() => (SITE && SITE.version) || 'web'), stamp = stampNow(), started = performance.now();
     RV.busy = true; RV.ac = new AbortController();
     recShow('busy', 'Recording… (the picture is at the top left of the window)');
     const undo = enterRecording(s, W, H);
@@ -1741,8 +1853,10 @@
     undo();
     RV.busy = false; RV.ac = null;
     if (!dlg.open) dlg.showModal();
+    if (blob && blob.size && blob.info && +blob.info.secondsPerFrame > 0) keepSpeed(s.res, blob.info.secondsPerFrame);
     describeRecord();
     if (blob && blob.size) {
+      const name = recName(s, withSound, await verP, stamp);
       saveBlob(blob, name);
       // the recorder's own remarks (blob.notes: e.g. the picture captured smaller and scaled, or no AAC sound here)
       const notes = [s.sound && !withSound ? 'It has no sound: this browser can’t make AAC sound.' : '', ...(Array.isArray(blob.notes) ? blob.notes.map(String) : [])].filter(Boolean);
@@ -1815,21 +1929,26 @@
     }
     if (clash.length && !confirm(`${listFrames(clash)[0].toUpperCase()}${listFrames(clash).slice(1)} ${clash.length > 1 ? 'were' : 'was'} changed ${HOSTED ? 'on the web page' : 'here'} since these edits were made.\n\nOK uses the adjustments in the file. Cancel keeps ${HOSTED ? 'the web page’s' : 'the ones saved here'} for ${clash.length > 1 ? 'those frames' : 'that frame'}.`))
       for (const n of clash) delete frames[n];
-    // the words: line by line onto what's there (a line changed on both sides is asked about)
-    let words = null;
+    // the words: line by line onto what's there (a line changed on both sides is asked about); each picture checked first
+    // (cleanWords: a picture the web page has, one this file brings, or here, one added in this browser)
+    let words = null, dropped = [];
+    const pics = b.pictures && typeof b.pictures === 'object' ? b.pictures : {};
+    const brings = Object.keys(pics).filter(s => SAFE_SRC.test(s) && pics[s] && typeof pics[s].data === 'string');
     if (b.content && b.content.frames && typeof b.content.frames === 'object' && tWords) {
-      const m = merge3(b.contentBase && b.contentBase.frames ? b.contentBase : null, b.content, tWords);
+      const cw = cleanWords(b.content, brings), base = b.contentBase && b.contentBase.frames ? cleanWords(b.contentBase, brings).data : null;
+      dropped = cw.dropped;
+      const m = merge3(base, cw.data, tWords);
       const there = HOSTED ? 'on the web page' : 'here';
       settle(m.conflicts, m.out, { intro: `${m.conflicts.length > 1 ? 'These lines were' : 'This line was'} changed both in ${file.name} and ${there} since the edits were made:`,
         mine: `in ${file.name}`, theirs: there, ok: `OK uses the words in ${file.name}. Cancel keeps the ones ${there}.` });
       if (contentDiffers(m.out, tWords)) words = m.out;
     }
-    const pics = b.pictures && typeof b.pictures === 'object' ? b.pictures : {};
-    const used = words ? picSrcs(words).filter(s => pics[s] && typeof pics[s].data === 'string') : [];
+    const used = words ? picSrcs(words).filter(s => brings.includes(s)) : [];
     const fl = Object.keys(frames).map(Number).sort((x, y) => x - y), wl = words ? FR.map(f => f[0]).filter(n => frameDiffers(words, tWords, n)) : [];
     const had = HOSTED && (Object.keys(WEB.frames).length > 0 || !!WEB.content);
-    if (!fl.length && !wl.length && !had) { alert(`The edits in ${file.name} are already ${HOSTED ? 'on this page' : 'in this project'}: nothing to change.`); return; }
-    const sum = [fl.length ? `• adjustments on ${listFrames(fl)}` : '', wl.length ? `• words and pictures on ${listFrames(wl)}` : '', used.length ? `• ${used.length} picture${used.length > 1 ? 's' : ''} added on the web page` : ''].filter(Boolean).join('\n') || '• nothing different from the web page as published';
+    const left = dropped.length ? `\n\n${droppedNote(dropped).replace('on this web page', HOSTED ? 'on this web page' : 'named as a picture in assets/copy/')}` : '';
+    if (!fl.length && !wl.length && !had) { alert(`The edits in ${file.name} are already ${HOSTED ? 'on this page' : 'in this project'}: nothing to change.${left}`); return; }
+    const sum = ([fl.length ? `• adjustments on ${listFrames(fl)}` : '', wl.length ? `• words and pictures on ${listFrames(wl)}` : '', used.length ? `• ${used.length} picture${used.length > 1 ? 's' : ''} added on the web page` : ''].filter(Boolean).join('\n') || '• nothing different from the web page as published') + left;
     if (!confirm(HOSTED ? `Load the edits from ${file.name}?\n\n${sum}\n\n${had ? 'They replace the edits saved in this browser (the words are kept under Earlier saved versions; Download my edits first to keep the rest).' : 'They’re saved in this browser.'}`
       : `Put the edits from ${file.name} into this project?\n\n${sum}\n\nThey’re written to frames/, content/copy.json (the version there now is kept as an earlier version first) and assets/copy/. Export video… then includes them.`)) return;
     try {
@@ -1844,8 +1963,8 @@
           const s = typeof v === 'string' ? v.trim() : v && typeof v.src === 'string' ? v.src.trim() : null;
           if (s && rename[s]) f.pictures[k] = typeof v === 'string' ? rename[s] : { ...v, src: rename[s] };
         }
-        LS.put('v2web.frames', fl.length ? frames : null); WEB.frames = fl.length ? frames : {};
-        await storeWords(words);
+        LS.put('v2web.frames', storeOf(frames, tFrames)); WEB.frames = { ...frames }; WEB.base = { ...tFrames };
+        await storeWords(words ? cleanWords(words).data : null);     // (checked again, now the pictures it brings are here)
       } else {
         const body = { frames: Object.fromEntries(fl.map(n => [n, { edit: fileOf(n, frames[n]), base: fileOf(n, savedEd[n]) }])),
           content: words ? { base: tWords, content: words } : null, pictures: used.map(src => ({ src, data: pics[src].data })) };
@@ -1907,7 +2026,8 @@
       if (ui.edit) { E.toggle(true); E.select(ui.n || E.n); await E.build(); $('#editPanel').scrollTop = ui.scroll || 0; }
       if (ui.exportOpen) openExport();
     }
-    if (flash) flashNote(flash);
+    if (WEB.notes.length) flash = [flash, ...WEB.notes].filter(Boolean).join(' ');   // (said once: what changed while the page loaded)
+    if (flash) flashNote(flash, WEB.notes.length ? 25000 : 12000);
     if (HOSTED) return;
     // an export that's still running (started earlier) shows on the button
     try { const r = await realFetch('/api/export/status', { cache: 'no-store' }); if (r.ok) { X.online = true; const { job } = await r.json(); xShow(job); if (job && ['starting', 'loading', 'rendering', 'encoding'].includes(job.state)) xStartPolling(); } } catch {}
