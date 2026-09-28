@@ -66,6 +66,8 @@
   .chips button.unsaved { border-style: dashed; border-color: var(--unsaved); }
   .chips button.sel { box-shadow: 0 0 0 2px var(--edited); }
   label { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); }
+  .speedopt input { width: 180px; margin: 0; accent-color: var(--accent); }
+  .speedopt output { min-width: 42px; color: var(--text); font-variant-numeric: tabular-nums; cursor: pointer; }
   select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font: inherit; }
   .legend { color: var(--dim); font-size: 12px; }
   .legend em { display: inline-block; width: 18px; height: 8px; background: var(--hold); border-radius: 2px; vertical-align: middle; margin-right: 4px; }
@@ -250,7 +252,8 @@
   </div>
   <div class="chips" id="chips" aria-label="Jump to a board's held moment"></div>
   <div class="row">
-    <label>Speed <select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
+    <label class="speedopt" title="Drag for slower or faster; double-click (or click the value) for 1×">Speed <input type="range" id="speed" min="0" max="11" step="1" value="3" list="speedStops" aria-label="Playback speed"><output id="speedName">1×</output></label>
+    <datalist id="speedStops"><option value="0"></option><option value="3"></option><option value="7"></option><option value="11"></option></datalist>
     <label><input type="checkbox" id="loop" checked> Loop</label>
     <label title="Play the sound effects with the picture (they follow play, pause, the playhead, the speed and the loop)"><input type="checkbox" id="sound"> Sound</label><span id="soundNote" aria-live="polite"></span>
     <label id="notesLabel"><input type="checkbox" id="notes" checked> Notes</label>
@@ -340,7 +343,7 @@
     <label><input type="checkbox" id="exSound" checked> <span id="exSoundName">Sound effects track</span></label>
   </div></div>
   <p class="hint" id="exSoundHint"></p>
-  <div class="xrow mac"><span>Speed</span><div><select id="exSpeed"><option value="0.5">0.5× (twice as long)</option><option value="0.75">0.75×</option><option value="1" selected>1× (as it plays)</option><option value="1.5">1.5×</option><option value="2">2× (half as long)</option></select></div></div>
+  <div class="xrow mac"><span>Speed</span><div><select id="exSpeed"><option value="0.25">0.25× (4× as long)</option><option value="0.5">0.5× (twice as long)</option><option value="0.75">0.75×</option><option value="1" selected>1× (as it plays)</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2× (half as long)</option><option value="2.5">2.5×</option><option value="3">3×</option><option value="4">4×</option><option value="5">5×</option></select></div></div>
   <div class="uses" id="exUses"></div>
   <div class="note err" id="exContent" hidden></div>
   <div class="note warn" id="exWarn" hidden></div>
@@ -674,7 +677,14 @@
 
   $('#play').onclick = () => P.playing ? P.pause() : P.play();
   $('#scrub').oninput = e => { P.pause(); P.seek(+e.target.value); };
-  $('#speed').onchange = e => { P.speed = +e.target.value; if (P.playing) SND.start(); };
+  // the speed slider, as v1's: 12 evenly spaced notches, 4× slower to 5× faster (quarter steps near 1×, bigger jumps above
+  // 2×); double-click it (or click the value) for 1×. SPEEDS is the same list as tools/export.mjs: keep them identical.
+  const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+  const speedIn = $('#speed');
+  const setSpeed = i => { i = Math.max(0, Math.min(SPEEDS.length - 1, Math.round(i))); speedIn.value = i; P.speed = SPEEDS[i]; $('#speedName').textContent = P.speed + '×'; if (P.playing) SND.start(); };
+  speedIn.oninput = () => setSpeed(+speedIn.value);
+  speedIn.ondblclick = $('#speedName').onclick = () => setSpeed(SPEEDS.indexOf(1));
+  setSpeed(SPEEDS.indexOf(1));
   $('#notes').onchange = e => { view.notes = e.target.checked; P.draw(); };
   $('#plates').onchange = e => { view.plates = e.target.checked; P.draw(); };
   $('#onionOn').onchange = () => { $('#epOnion').checked = $('#onionOn').checked; P.draw(); };
